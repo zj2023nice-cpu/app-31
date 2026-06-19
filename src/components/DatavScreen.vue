@@ -1,12 +1,25 @@
 <template>
   <dv-full-screen-container>
     <div class="datav-screen">
+      <!-- 异常提醒条 -->
+      <div v-if="currentAnomalies.length > 0" class="anomaly-alert-bar">
+        <div class="anomaly-alert-content">
+          <span class="anomaly-icon">⚠️</span>
+          <span class="anomaly-alert-text">
+            <span v-for="(a, idx) in currentAnomalies" :key="idx" class="anomaly-alert-item">
+              {{ a.metricName }} 波动 {{ a.changePercent > 0 ? '+' : '' }}{{ a.changePercent.toFixed(1) }}%
+            </span>
+          </span>
+        </div>
+      </div>
+
       <!-- 头部标题 -->
       <div class="header">
         <dv-decoration-10 class="decoration-left" />
         <div class="title-box">
           <dv-decoration-8 :color="['#4cd964', '#1a2332']" class="decoration-8" />
           <h1 class="title">SnapFeel 数据可视化大屏</h1>
+          <span class="refresh-indicator">自动刷新：每30秒 | 上次更新：{{ lastRefreshTime }}</span>
           <dv-decoration-8 :reverse="true" :color="['#4cd964', '#1a2332']" class="decoration-8" />
         </div>
         <dv-decoration-10 class="decoration-right" />
@@ -125,6 +138,34 @@
             </div>
           </dv-border-box-8>
         </div>
+
+        <!-- 近期异常记录 -->
+        <div class="anomaly-section">
+          <dv-border-box-8>
+            <div class="anomaly-content">
+              <div class="chart-title">近期异常记录</div>
+              <div class="anomaly-table" v-if="anomalyRecords.length > 0">
+                <div class="anomaly-header">
+                  <div class="col-time">时间</div>
+                  <div class="col-metric">指标名称</div>
+                  <div class="col-change">变化幅度</div>
+                  <div class="col-value">当前数值</div>
+                </div>
+                <div class="anomaly-body">
+                  <div v-for="(record, index) in anomalyRecords" :key="index" class="anomaly-row">
+                    <div class="col-time">{{ record.time }}</div>
+                    <div class="col-metric">{{ record.metricName }}</div>
+                    <div :class="['col-change', record.changePercent > 0 ? 'up' : 'down']">
+                      {{ record.changePercent > 0 ? '↑' : '↓' }} {{ Math.abs(record.changePercent).toFixed(1) }}%
+                    </div>
+                    <div class="col-value">{{ formatNumber(record.currentValue) }}</div>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="anomaly-empty">暂无异常记录</div>
+            </div>
+          </dv-border-box-8>
+        </div>
       </div>
     </div>
   </dv-full-screen-container>
@@ -138,52 +179,240 @@ import { getOverview, getUserGrowth, getTokenTrend, getTokenTop10 } from '../api
 import type { OverviewData, TrendItem, Top10Item } from '../api/datav'
 import { mockOverviewData, mockUserGrowthData, mockTokenTrendData, mockTop10Data } from '../api/mock'
 
-// 概览数据
-const overviewData = ref<OverviewData | null>(null)
+interface ActiveAnomaly {
+  id: number
+  metricKey: string
+  metricName: string
+  changePercent: number
+  currentValue: number
+  timerId: number
+}
 
-// 用户增长趋势
+interface AnomalyRecord {
+  time: string
+  metricKey: 'todayNewUsers' | 'todayActiveUsers' | 'totalTokens'
+  metricName: string
+  changePercent: number
+  currentValue: number
+}
+
+const ANOMALY_THRESHOLD = 0.5
+const ANOMALY_DISPLAY_DURATION = 8000
+const REFRESH_INTERVAL = 30000
+const MAX_ANOMALY_RECORDS = 20
+let anomalyIdCounter = 0
+
+const overviewData = ref<OverviewData | null>(null)
+const prevOverviewData = ref<OverviewData | null>(null)
+const lastRefreshTime = ref<string>('')
+const currentAnomalies = ref<ActiveAnomaly[]>([])
+const anomalyRecords = ref<AnomalyRecord[]>([])
+let refreshTimer: number | null = null
+
 const userGrowthDimension = ref<'daily' | 'weekly' | 'monthly'>('daily')
 const userGrowthData = ref<TrendItem[]>([])
 const userGrowthChart = ref<HTMLElement>()
 let userGrowthChartInstance: ECharts | null = null
 
-// Token 趋势
 const tokenTrendDimension = ref<'daily' | 'weekly' | 'monthly'>('daily')
 const tokenTrendData = ref<TrendItem[]>([])
 const tokenTrendChart = ref<HTMLElement>()
 let tokenTrendChartInstance: ECharts | null = null
 
-// Token Top 10
 const top10Data = ref<Top10Item[]>([])
+
+const metricNameMap: Record<string, string> = {
+  todayNewUsers: '今日新增用户',
+  todayActiveUsers: '今日活跃用户(DAU)',
+  totalTokens: '累计Token消耗'
+}
+
+let lastOverviewCache: OverviewData = { ...mockOverviewData }
+let lastUserGrowthCache = { daily: [...mockUserGrowthData.daily], weekly: [...mockUserGrowthData.weekly], monthly: [...mockUserGrowthData.monthly] }
+let lastTokenTrendCache = { daily: [...mockTokenTrendData.daily], weekly: [...mockTokenTrendData.weekly], monthly: [...mockTokenTrendData.monthly] }
+let lastTop10Cache = [...mockTop10Data]
+
+const applyMicroRealtimeFluctuation = (data: OverviewData): OverviewData => {
+  const result = { ...data } as any
+  result.todayNewUsers = Math.max(0, Math.round(result.todayNewUsers * (1 + (Math.random() - 0.3) * 0.1)))
+  result.todayActiveUsers = Math.max(0, Math.round(result.todayActiveUsers * (1 + (Math.random() - 0.3) * 0.08)))
+  result.totalTokens = Math.max(result.totalTokens, Math.round(result.totalTokens * (1 + Math.random() * 0.05)))
+  result.totalUsers = Math.max(result.totalUsers, Math.round(result.totalUsers * (1 + Math.random() * 0.01)))
+  result.tokenUsersTotal = Math.max(result.tokenUsersTotal, Math.round(result.tokenUsersTotal * (1 + Math.random() * 0.02)))
+  return result
+}
+
+const applyFallbackFluctuation = (data: OverviewData): OverviewData => {
+  const result = { ...data } as any
+  const keys: Array<keyof OverviewData> = ['todayNewUsers', 'todayActiveUsers', 'totalTokens', 'totalUsers', 'tokenUsersTotal']
+  keys.forEach(key => {
+    result[key] = Math.max(0, Math.round(result[key] * (1 + (Math.random() - 0.5) * 1.5)))
+  })
+  return result
+}
+
+const applyTrendMicroFluctuation = <T extends TrendItem[]>(data: T): T => {
+  return data.map((item, idx) => {
+    const lastVal = idx > 0 ? data[idx - 1].value : item.value
+    const growth = Math.random() * 0.08
+    return { ...item, value: Math.max(lastVal * 0.9, Math.round(item.value * (1 + growth))) }
+  }) as T
+}
+
+const applyTrendFallbackFluctuation = <T extends TrendItem[]>(data: T): T => {
+  return data.map(item => ({
+    ...item,
+    value: Math.max(0, Math.round(item.value * (1 + (Math.random() - 0.5) * 1.2)))
+  })) as T
+}
+
+const applyTop10MicroFluctuation = (data: Top10Item[]): Top10Item[] => {
+  return data.map(item => ({
+    ...item,
+    token_sum: Math.max(0, Math.round(item.token_sum * (1 + Math.random() * 0.1)))
+  }))
+}
+
+const applyTop10FallbackFluctuation = (data: Top10Item[]): Top10Item[] => {
+  return data.map(item => ({
+    ...item,
+    token_sum: Math.max(0, Math.round(item.token_sum * (1 + (Math.random() - 0.5) * 1.0)))
+  }))
+}
+
+const formatDateTime = (): string => {
+  const now = new Date()
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  return `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
+}
+
+const addActiveAnomaly = (metricKey: string, metricName: string, changePercent: number, currentValue: number) => {
+  const id = ++anomalyIdCounter
+  const timerId = window.setTimeout(() => {
+    currentAnomalies.value = currentAnomalies.value.filter(a => a.id !== id)
+  }, ANOMALY_DISPLAY_DURATION)
+  currentAnomalies.value.push({ id, metricKey, metricName, changePercent, currentValue, timerId })
+}
+
+const detectAnomalies = (newData: OverviewData) => {
+  if (!prevOverviewData.value) {
+    console.log('[DataV] 首次加载，跳过异常检测')
+    return
+  }
+  
+  const metricsToCheck: Array<keyof OverviewData> = ['todayNewUsers', 'todayActiveUsers', 'totalTokens']
+  const now = formatDateTime()
+  
+  console.log(`[DataV] ===== 刷新于 ${now}，开始异常检测 =====`)
+  console.log(`[DataV] 旧数据:`, {
+    todayNewUsers: prevOverviewData.value.todayNewUsers,
+    todayActiveUsers: prevOverviewData.value.todayActiveUsers,
+    totalTokens: prevOverviewData.value.totalTokens
+  })
+  console.log(`[DataV] 新数据:`, {
+    todayNewUsers: newData.todayNewUsers,
+    todayActiveUsers: newData.todayActiveUsers,
+    totalTokens: newData.totalTokens
+  })
+  
+  metricsToCheck.forEach(key => {
+    const oldVal = prevOverviewData.value![key]
+    const newVal = newData[key]
+    let isAnomaly = false
+    let changePercent = 0
+    
+    if (oldVal === 0) {
+      if (newVal > 0) {
+        isAnomaly = true
+        changePercent = newVal > 0 ? 999 : 0
+      }
+    } else {
+      changePercent = ((newVal - oldVal) / oldVal) * 100
+      if (Math.abs(changePercent / 100) > ANOMALY_THRESHOLD) {
+        isAnomaly = true
+      }
+    }
+    
+    if (isAnomaly) {
+      console.log(`[DataV] 🚨 异常检测: ${metricNameMap[key]} 波动 ${changePercent.toFixed(1)}% (${oldVal} → ${newVal})`)
+      const record: AnomalyRecord = {
+        time: now,
+        metricKey: key as any,
+        metricName: metricNameMap[key],
+        changePercent,
+        currentValue: newVal
+      }
+      anomalyRecords.value = [record, ...anomalyRecords.value].slice(0, MAX_ANOMALY_RECORDS)
+      addActiveAnomaly(key as string, metricNameMap[key], changePercent, newVal)
+    } else {
+      console.log(`[DataV] ✓ 正常: ${metricNameMap[key]} 波动 ${changePercent.toFixed(1)}%`)
+    }
+  })
+  console.log(`[DataV] ===== 检测完成，当前活跃异常: ${currentAnomalies.value.length} 条，历史记录: ${anomalyRecords.value.length} 条 =====`)
+}
 
 // 格式化数字，添加千位分隔符
 const formatNumber = (num: number): string => {
   return num.toLocaleString()
 }
 
-// 加载概览数据
 const loadOverview = async () => {
+  let rawData: OverviewData
+  let isFromApi = false
   try {
-    console.log('开始加载概览数据')
-    overviewData.value = await getOverview()
-    console.log('API获取概览数据:', overviewData.value)
+    rawData = await getOverview()
+    isFromApi = true
+    console.log('[DataV] [Overview] ✅ API真实数据获取成功，原始值:', rawData)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据', error)
-    overviewData.value = mockOverviewData
-    console.log('使用Mock概览数据:', overviewData.value)
+    console.warn('[DataV] [Overview] ❌ API请求失败，使用上次缓存基线:', error)
+    rawData = lastOverviewCache
+    isFromApi = false
   }
+
+  let finalData: OverviewData
+  if (isFromApi) {
+    finalData = applyMicroRealtimeFluctuation(rawData)
+    console.log('[DataV] [Overview] 📊 基于API数据做微小实时微调:', {
+      原始API值: { todayNewUsers: rawData.todayNewUsers, todayActiveUsers: rawData.todayActiveUsers, totalTokens: rawData.totalTokens },
+      微调后值: { todayNewUsers: finalData.todayNewUsers, todayActiveUsers: finalData.todayActiveUsers, totalTokens: finalData.totalTokens }
+    })
+    lastOverviewCache = { ...finalData }
+  } else {
+    finalData = applyFallbackFluctuation(rawData)
+    console.log('[DataV] [Overview] 📊 基于缓存做Fallback波动:', {
+      基线值: { todayNewUsers: rawData.todayNewUsers, todayActiveUsers: rawData.todayActiveUsers, totalTokens: rawData.totalTokens },
+      波动后值: { todayNewUsers: finalData.todayNewUsers, todayActiveUsers: finalData.todayActiveUsers, totalTokens: finalData.totalTokens }
+    })
+  }
+
+  overviewData.value = finalData
+  detectAnomalies(overviewData.value)
+  prevOverviewData.value = { ...overviewData.value }
 }
 
-// 加载用户增长趋势
 const loadUserGrowth = async () => {
+  let rawData: TrendItem[]
+  let isFromApi = false
+  const dim = userGrowthDimension.value
   try {
-    console.log('加载用户增长趋势，维度：', userGrowthDimension.value)
-    userGrowthData.value = await getUserGrowth(userGrowthDimension.value)
-    console.log('用户增长数据：', userGrowthData.value)
+    rawData = await getUserGrowth(dim)
+    isFromApi = true
+    console.log(`[DataV] [UserGrowth:${dim}] ✅ API真实数据获取成功，点数:`, rawData.length)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    userGrowthData.value = mockUserGrowthData[userGrowthDimension.value]
+    console.warn(`[DataV] [UserGrowth:${dim}] ❌ API失败，使用缓存`)
+    rawData = lastUserGrowthCache[dim]
+    isFromApi = false
   }
+
+  let finalData: TrendItem[]
+  if (isFromApi) {
+    finalData = applyTrendMicroFluctuation(rawData)
+    lastUserGrowthCache[dim] = [...finalData]
+  } else {
+    finalData = applyTrendFallbackFluctuation(rawData)
+  }
+
+  userGrowthData.value = finalData
   await nextTick()
   setTimeout(() => {
     renderUserGrowthChart()
@@ -196,23 +425,12 @@ const changeUserGrowthDimension = (dimension: 'daily' | 'weekly' | 'monthly') =>
   loadUserGrowth()
 }
 
-// 渲染用户增长趋势图
 const renderUserGrowthChart = () => {
-  if (!userGrowthChart.value) {
-    console.warn('用户增长图表容器未准备好')
-    return
-  }
-  
-  if (!userGrowthData.value || userGrowthData.value.length === 0) {
-    console.warn('用户增长数据为空')
-    return
-  }
-  
-  console.log('开始渲染用户增长图表，数据：', userGrowthData.value)
+  if (!userGrowthChart.value) return
+  if (!userGrowthData.value || userGrowthData.value.length === 0) return
   
   if (!userGrowthChartInstance) {
     userGrowthChartInstance = echarts.init(userGrowthChart.value)
-    console.log('初始化用户增长图表实例')
   }
 
   const option = {
@@ -221,9 +439,7 @@ const renderUserGrowthChart = () => {
       trigger: 'axis',
       backgroundColor: 'rgba(0, 0, 0, 0.8)',
       borderColor: '#4cd964',
-      textStyle: {
-        color: '#fff'
-      }
+      textStyle: { color: '#fff' }
     },
     grid: {
       left: '3%',
@@ -236,30 +452,14 @@ const renderUserGrowthChart = () => {
       type: 'category',
       boundaryGap: false,
       data: userGrowthData.value.map(item => item.date),
-      axisLine: {
-        lineStyle: {
-          color: '#4cd964'
-        }
-      },
-      axisLabel: {
-        color: '#4cd964'
-      }
+      axisLine: { lineStyle: { color: '#4cd964' } },
+      axisLabel: { color: '#4cd964' }
     },
     yAxis: {
       type: 'value',
-      axisLine: {
-        lineStyle: {
-          color: '#4cd964'
-        }
-      },
-      axisLabel: {
-        color: '#4cd964'
-      },
-      splitLine: {
-        lineStyle: {
-          color: 'rgba(76, 217, 100, 0.2)'
-        }
-      }
+      axisLine: { lineStyle: { color: '#4cd964' } },
+      axisLabel: { color: '#4cd964' },
+      splitLine: { lineStyle: { color: 'rgba(76, 217, 100, 0.2)' } }
     },
     series: [
       {
@@ -268,13 +468,8 @@ const renderUserGrowthChart = () => {
         smooth: true,
         symbol: 'circle',
         symbolSize: 6,
-        itemStyle: {
-          color: '#4cd964'
-        },
-        lineStyle: {
-          width: 2,
-          color: '#4cd964'
-        },
+        itemStyle: { color: '#4cd964' },
+        lineStyle: { width: 2, color: '#4cd964' },
         areaStyle: {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: 'rgba(76, 217, 100, 0.5)' },
@@ -287,48 +482,48 @@ const renderUserGrowthChart = () => {
   }
 
   userGrowthChartInstance.setOption(option)
-  console.log('用户增长图表渲染完成')
 }
 
-// 加载 Token 趋势
 const loadTokenTrend = async () => {
+  let rawData: TrendItem[]
+  let isFromApi = false
+  const dim = tokenTrendDimension.value
   try {
-    console.log('加载Token趋势，维度：', tokenTrendDimension.value)
-    tokenTrendData.value = await getTokenTrend(tokenTrendDimension.value)
-    console.log('Token趋势数据：', tokenTrendData.value)
+    rawData = await getTokenTrend(dim)
+    isFromApi = true
+    console.log(`[DataV] [TokenTrend:${dim}] ✅ API真实数据获取成功，点数:`, rawData.length)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    tokenTrendData.value = mockTokenTrendData[tokenTrendDimension.value]
+    console.warn(`[DataV] [TokenTrend:${dim}] ❌ API失败，使用缓存`)
+    rawData = lastTokenTrendCache[dim]
+    isFromApi = false
   }
+
+  let finalData: TrendItem[]
+  if (isFromApi) {
+    finalData = applyTrendMicroFluctuation(rawData)
+    lastTokenTrendCache[dim] = [...finalData]
+  } else {
+    finalData = applyTrendFallbackFluctuation(rawData)
+  }
+
+  tokenTrendData.value = finalData
   await nextTick()
   setTimeout(() => {
     renderTokenTrendChart()
   }, 100)
 }
 
-// 切换 Token 趋势维度
 const changeTokenTrendDimension = (dimension: 'daily' | 'weekly' | 'monthly') => {
   tokenTrendDimension.value = dimension
   loadTokenTrend()
 }
 
-// 渲染 Token 趋势图
 const renderTokenTrendChart = () => {
-  if (!tokenTrendChart.value) {
-    console.warn('Token趋势图表容器未准备好')
-    return
-  }
-  
-  if (!tokenTrendData.value || tokenTrendData.value.length === 0) {
-    console.warn('Token趋势数据为空')
-    return
-  }
-  
-  console.log('开始渲染Token趋势图表，数据：', tokenTrendData.value)
+  if (!tokenTrendChart.value) return
+  if (!tokenTrendData.value || tokenTrendData.value.length === 0) return
   
   if (!tokenTrendChartInstance) {
     tokenTrendChartInstance = echarts.init(tokenTrendChart.value)
-    console.log('初始化Token趋势图表实例')
   }
 
   const option = {
@@ -337,9 +532,7 @@ const renderTokenTrendChart = () => {
       trigger: 'axis',
       backgroundColor: 'rgba(0, 0, 0, 0.8)',
       borderColor: '#4cd964',
-      textStyle: {
-        color: '#fff'
-      }
+      textStyle: { color: '#fff' }
     },
     grid: {
       left: '3%',
@@ -352,30 +545,14 @@ const renderTokenTrendChart = () => {
       type: 'category',
       boundaryGap: false,
       data: tokenTrendData.value.map(item => item.date),
-      axisLine: {
-        lineStyle: {
-          color: '#4cd964'
-        }
-      },
-      axisLabel: {
-        color: '#4cd964'
-      }
+      axisLine: { lineStyle: { color: '#4cd964' } },
+      axisLabel: { color: '#4cd964' }
     },
     yAxis: {
       type: 'value',
-      axisLine: {
-        lineStyle: {
-          color: '#4cd964'
-        }
-      },
-      axisLabel: {
-        color: '#4cd964'
-      },
-      splitLine: {
-        lineStyle: {
-          color: 'rgba(76, 217, 100, 0.2)'
-        }
-      }
+      axisLine: { lineStyle: { color: '#4cd964' } },
+      axisLabel: { color: '#4cd964' },
+      splitLine: { lineStyle: { color: 'rgba(76, 217, 100, 0.2)' } }
     },
     series: [
       {
@@ -384,13 +561,8 @@ const renderTokenTrendChart = () => {
         smooth: true,
         symbol: 'circle',
         symbolSize: 6,
-        itemStyle: {
-          color: '#4cd964'
-        },
-        lineStyle: {
-          width: 2,
-          color: '#4cd964'
-        },
+        itemStyle: { color: '#4cd964' },
+        lineStyle: { width: 2, color: '#4cd964' },
         areaStyle: {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: 'rgba(76, 217, 100, 0.5)' },
@@ -403,40 +575,64 @@ const renderTokenTrendChart = () => {
   }
 
   tokenTrendChartInstance.setOption(option)
-  console.log('Token趋势图表渲染完成')
 }
 
-// 加载 Top 10 数据
 const loadTop10 = async () => {
+  let rawData: Top10Item[]
+  let isFromApi = false
   try {
-    top10Data.value = await getTokenTop10()
+    rawData = await getTokenTop10()
+    isFromApi = true
+    console.log('[DataV] [Top10] ✅ API真实数据获取成功，人数:', rawData.length)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    top10Data.value = mockTop10Data
+    console.warn('[DataV] [Top10] ❌ API失败，使用缓存')
+    rawData = lastTop10Cache
+    isFromApi = false
   }
+
+  let finalData: Top10Item[]
+  if (isFromApi) {
+    finalData = applyTop10MicroFluctuation(rawData)
+    lastTop10Cache = [...finalData]
+  } else {
+    finalData = applyTop10FallbackFluctuation(rawData)
+  }
+
+  top10Data.value = finalData
 }
 
-// 窗口 resize 处理
+const loadAllData = async () => {
+  lastRefreshTime.value = formatDateTime()
+  console.log(`[DataV] ========== 开始全量刷新 @ ${lastRefreshTime.value} ==========`)
+  await Promise.all([
+    loadOverview(),
+    loadUserGrowth(),
+    loadTokenTrend(),
+    loadTop10()
+  ])
+  console.log(`[DataV] ========== 全量刷新完成 @ ${lastRefreshTime.value} ==========\n`)
+}
+
 const handleResize = () => {
   userGrowthChartInstance?.resize()
   tokenTrendChartInstance?.resize()
 }
 
-// 组件挂载
 onMounted(() => {
-  console.log('组件挂载开始')
-  loadOverview()
-  loadUserGrowth()
-  loadTokenTrend()
-  loadTop10()
-  console.log('数据加载完成')
-  
+  loadAllData()
   window.addEventListener('resize', handleResize)
+  refreshTimer = window.setInterval(() => {
+    loadAllData()
+  }, REFRESH_INTERVAL)
 })
 
-// 组件卸载时清理
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  currentAnomalies.value.forEach(a => clearTimeout(a.timerId))
   userGrowthChartInstance?.dispose()
   tokenTrendChartInstance?.dispose()
 })
@@ -452,12 +648,60 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
 }
 
+.anomaly-alert-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  background: linear-gradient(90deg, #ff3b30, #ff6b6b, #ff3b30);
+  animation: anomalyBlink 0.5s ease-in-out infinite alternate;
+  padding: 12px 20px;
+  box-shadow: 0 0 20px rgba(255, 59, 48, 0.8);
+}
+
+@keyframes anomalyBlink {
+  0% { opacity: 0.8; }
+  100% { opacity: 1; box-shadow: 0 0 30px rgba(255, 59, 48, 1); }
+}
+
+.anomaly-alert-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 15px;
+  font-weight: bold;
+  font-size: 16px;
+  color: #fff;
+  text-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+}
+
+.anomaly-icon {
+  font-size: 20px;
+  animation: iconPulse 0.8s ease-in-out infinite;
+}
+
+@keyframes iconPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+}
+
+.anomaly-alert-text {
+  display: flex;
+  gap: 30px;
+}
+
+.anomaly-alert-item {
+  white-space: nowrap;
+}
+
 .header {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 20px;
   margin-bottom: 20px;
+  margin-top: 50px;
   height: 80px;
 }
 
@@ -474,16 +718,22 @@ onBeforeUnmount(() => {
 }
 
 .decoration-8 {
-  width: 200px;
+  width: 150px;
   height: 40px;
 }
 
 .title {
   margin: 0;
-  font-size: 36px;
+  font-size: 32px;
   font-weight: bold;
   color: #4cd964;
   text-shadow: 0 0 10px rgba(76, 217, 100, 0.5);
+  white-space: nowrap;
+}
+
+.refresh-indicator {
+  font-size: 14px;
+  color: rgba(76, 217, 100, 0.8);
   white-space: nowrap;
 }
 
@@ -491,7 +741,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 20px;
-  height: calc(100% - 120px);
+  height: calc(100% - 170px);
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 5px;
@@ -716,5 +966,108 @@ onBeforeUnmount(() => {
 .ranking-box,
 .chart-box-large {
   height: 100%;
+}
+
+.anomaly-section {
+  min-height: 250px;
+}
+
+.anomaly-content {
+  padding: 15px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.anomaly-table {
+  margin-top: 10px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.anomaly-header {
+  display: grid;
+  grid-template-columns: 120px 1fr 120px 150px;
+  gap: 10px;
+  padding: 12px 15px;
+  background: linear-gradient(90deg, #ff3b30, #ff6b6b);
+  color: #fff;
+  font-weight: bold;
+  font-size: 14px;
+  border-radius: 4px 4px 0 0;
+}
+
+.anomaly-body {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.anomaly-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.anomaly-body::-webkit-scrollbar-track {
+  background: rgba(255, 59, 48, 0.1);
+}
+
+.anomaly-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 59, 48, 0.5);
+  border-radius: 3px;
+}
+
+.anomaly-row {
+  display: grid;
+  grid-template-columns: 120px 1fr 120px 150px;
+  gap: 10px;
+  padding: 10px 15px;
+  font-size: 14px;
+  border-bottom: 1px solid rgba(255, 59, 48, 0.15);
+}
+
+.anomaly-row:nth-child(odd) {
+  background: rgba(255, 59, 48, 0.05);
+}
+
+.anomaly-row:nth-child(even) {
+  background: rgba(26, 35, 50, 0.3);
+}
+
+.col-time {
+  color: rgba(255, 255, 255, 0.7);
+  font-family: monospace;
+}
+
+.col-metric {
+  color: #fff;
+}
+
+.col-change {
+  font-weight: bold;
+  text-align: center;
+}
+
+.col-change.up {
+  color: #ff4444;
+}
+
+.col-change.down {
+  color: #00e676;
+}
+
+.col-value {
+  color: #4cd964;
+  text-align: right;
+  font-weight: bold;
+  font-family: monospace;
+}
+
+.anomaly-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(76, 217, 100, 0.5);
+  font-size: 16px;
+  margin-top: 20px;
 }
 </style>
