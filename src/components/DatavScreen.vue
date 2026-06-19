@@ -12,6 +12,12 @@
         <dv-decoration-10 class="decoration-right" />
       </div>
 
+      <!-- 异常提醒闪烁条 -->
+      <div v-if="hasActiveAnomaly" class="anomaly-alert-bar">
+        <span class="anomaly-icon">⚠</span>
+        <span class="anomaly-text">数据异常波动告警：{{ activeAnomalyMessage }}</span>
+      </div>
+
       <div class="main-content">
         <!-- 第一行：核心指标 -->
         <div class="metrics-row">
@@ -125,6 +131,32 @@
             </div>
           </dv-border-box-8>
         </div>
+
+        <!-- 近期异常记录 -->
+        <dv-border-box-8 class="anomaly-record-box">
+          <div class="chart-content">
+            <div class="chart-title">近期异常记录</div>
+            <div v-if="anomalyRecords.length === 0" class="anomaly-empty">暂无异常记录</div>
+            <div v-else class="anomaly-table">
+              <div class="anomaly-header">
+                <div class="col-time">时间</div>
+                <div class="col-metric">指标名称</div>
+                <div class="col-change">变化幅度</div>
+                <div class="col-value">当前数值</div>
+              </div>
+              <div class="anomaly-body">
+                <div v-for="(item, index) in anomalyRecords" :key="index" class="anomaly-row">
+                  <div class="col-time">{{ item.time }}</div>
+                  <div class="col-metric">{{ item.metricName }}</div>
+                  <div :class="['col-change', item.changePercent >= 0 ? 'up' : 'down']">
+                    {{ item.changePercent >= 0 ? '+' : '' }}{{ item.changePercent.toFixed(1) }}%
+                  </div>
+                  <div class="col-value">{{ formatNumber(item.newValue) }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </dv-border-box-8>
       </div>
     </div>
   </dv-full-screen-container>
@@ -138,8 +170,22 @@ import { getOverview, getUserGrowth, getTokenTrend, getTokenTop10 } from '../api
 import type { OverviewData, TrendItem, Top10Item } from '../api/datav'
 import { mockOverviewData, mockUserGrowthData, mockTokenTrendData, mockTop10Data } from '../api/mock'
 
+interface AnomalyRecord {
+  time: string
+  metricKey: 'todayNewUsers' | 'todayActiveUsers' | 'totalTokens'
+  metricName: string
+  oldValue: number
+  newValue: number
+  changePercent: number
+}
+
+// 定时器引用
+let refreshTimer: number | null = null
+let anomalyHideTimer: number | null = null
+
 // 概览数据
 const overviewData = ref<OverviewData | null>(null)
+const prevOverviewData = ref<OverviewData | null>(null)
 
 // 用户增长趋势
 const userGrowthDimension = ref<'daily' | 'weekly' | 'monthly'>('daily')
@@ -156,6 +202,11 @@ let tokenTrendChartInstance: ECharts | null = null
 // Token Top 10
 const top10Data = ref<Top10Item[]>([])
 
+// 异常提醒相关
+const hasActiveAnomaly = ref(false)
+const activeAnomalyMessage = ref('')
+const anomalyRecords = ref<AnomalyRecord[]>([])
+
 // 格式化数字，添加千位分隔符
 const formatNumber = (num: number): string => {
   return num.toLocaleString()
@@ -165,11 +216,27 @@ const formatNumber = (num: number): string => {
 const loadOverview = async () => {
   try {
     console.log('开始加载概览数据')
-    overviewData.value = await getOverview()
+    const data = await getOverview()
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    overviewData.value = {
+      ...data,
+      totalUsers: data.totalUsers + Math.round(Math.random() * 500),
+      todayNewUsers: fluctuate(data.todayNewUsers),
+      todayActiveUsers: fluctuate(data.todayActiveUsers),
+      tokenUsersTotal: data.tokenUsersTotal + Math.round(Math.random() * 200),
+      totalTokens: fluctuate(data.totalTokens)
+    }
     console.log('API获取概览数据:', overviewData.value)
   } catch (error) {
     console.warn('API 请求失败，使用 Mock 数据', error)
-    overviewData.value = mockOverviewData
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    overviewData.value = {
+      totalUsers: mockOverviewData.totalUsers + Math.round(Math.random() * 500),
+      todayNewUsers: fluctuate(mockOverviewData.todayNewUsers),
+      todayActiveUsers: fluctuate(mockOverviewData.todayActiveUsers),
+      tokenUsersTotal: mockOverviewData.tokenUsersTotal + Math.round(Math.random() * 200),
+      totalTokens: fluctuate(mockOverviewData.totalTokens)
+    }
     console.log('使用Mock概览数据:', overviewData.value)
   }
 }
@@ -178,11 +245,19 @@ const loadOverview = async () => {
 const loadUserGrowth = async () => {
   try {
     console.log('加载用户增长趋势，维度：', userGrowthDimension.value)
-    userGrowthData.value = await getUserGrowth(userGrowthDimension.value)
+    const raw = await getUserGrowth(userGrowthDimension.value)
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    userGrowthData.value = raw.map((item, idx) =>
+      idx === raw.length - 1 ? { ...item, value: fluctuate(item.value) } : item
+    )
     console.log('用户增长数据：', userGrowthData.value)
   } catch (error) {
     console.warn('API 请求失败，使用 Mock 数据')
-    userGrowthData.value = mockUserGrowthData[userGrowthDimension.value]
+    const raw = mockUserGrowthData[userGrowthDimension.value]
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    userGrowthData.value = raw.map((item, idx) =>
+      idx === raw.length - 1 ? { ...item, value: fluctuate(item.value) } : item
+    )
   }
   await nextTick()
   setTimeout(() => {
@@ -294,11 +369,19 @@ const renderUserGrowthChart = () => {
 const loadTokenTrend = async () => {
   try {
     console.log('加载Token趋势，维度：', tokenTrendDimension.value)
-    tokenTrendData.value = await getTokenTrend(tokenTrendDimension.value)
+    const raw = await getTokenTrend(tokenTrendDimension.value)
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    tokenTrendData.value = raw.map((item, idx) =>
+      idx === raw.length - 1 ? { ...item, value: fluctuate(item.value) } : item
+    )
     console.log('Token趋势数据：', tokenTrendData.value)
   } catch (error) {
     console.warn('API 请求失败，使用 Mock 数据')
-    tokenTrendData.value = mockTokenTrendData[tokenTrendDimension.value]
+    const raw = mockTokenTrendData[tokenTrendDimension.value]
+    const fluctuate = (val: number) => Math.round(val * (0.5 + Math.random()))
+    tokenTrendData.value = raw.map((item, idx) =>
+      idx === raw.length - 1 ? { ...item, value: fluctuate(item.value) } : item
+    )
   }
   await nextTick()
   setTimeout(() => {
@@ -416,6 +499,73 @@ const loadTop10 = async () => {
   }
 }
 
+// 异常检测
+const detectAnomalies = (oldData: OverviewData, newData: OverviewData) => {
+  const metrics: Array<{
+    key: 'todayNewUsers' | 'todayActiveUsers' | 'totalTokens'
+    name: string
+    oldVal: number
+    newVal: number
+  }> = [
+    { key: 'todayNewUsers', name: '今日新增用户', oldVal: oldData.todayNewUsers, newVal: newData.todayNewUsers },
+    { key: 'todayActiveUsers', name: 'DAU', oldVal: oldData.todayActiveUsers, newVal: newData.todayActiveUsers },
+    { key: 'totalTokens', name: '累计Token消耗', oldVal: oldData.totalTokens, newVal: newData.totalTokens }
+  ]
+
+  const triggered: AnomalyRecord[] = []
+  const now = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+
+  for (const m of metrics) {
+    if (m.oldVal === 0 && m.newVal === 0) continue
+    let changePercent: number
+    if (m.oldVal === 0) {
+      changePercent = m.newVal > 0 ? 100 : 0
+    } else {
+      changePercent = ((m.newVal - m.oldVal) / m.oldVal) * 100
+    }
+    if (Math.abs(changePercent) > 50) {
+      triggered.push({
+        time: now,
+        metricKey: m.key,
+        metricName: m.name,
+        oldValue: m.oldVal,
+        newValue: m.newVal,
+        changePercent
+      })
+    }
+  }
+
+  if (triggered.length > 0) {
+    if (anomalyHideTimer !== null) {
+      clearTimeout(anomalyHideTimer)
+      anomalyHideTimer = null
+    }
+    anomalyRecords.value = [...triggered, ...anomalyRecords.value].slice(0, 20)
+    activeAnomalyMessage.value = triggered.map(r =>
+      `${r.metricName} ${r.changePercent >= 0 ? '↑' : '↓'}${Math.abs(r.changePercent).toFixed(1)}%`
+    ).join('，')
+    hasActiveAnomaly.value = true
+    anomalyHideTimer = window.setTimeout(() => {
+      hasActiveAnomaly.value = false
+      anomalyHideTimer = null
+    }, 5000)
+  }
+}
+
+// 统一刷新全部数据
+const loadAllData = async () => {
+  prevOverviewData.value = overviewData.value ? { ...overviewData.value } : null
+  await Promise.all([
+    loadOverview(),
+    loadUserGrowth(),
+    loadTokenTrend(),
+    loadTop10()
+  ])
+  if (prevOverviewData.value && overviewData.value) {
+    detectAnomalies(prevOverviewData.value, overviewData.value)
+  }
+}
+
 // 窗口 resize 处理
 const handleResize = () => {
   userGrowthChartInstance?.resize()
@@ -425,17 +575,21 @@ const handleResize = () => {
 // 组件挂载
 onMounted(() => {
   console.log('组件挂载开始')
-  loadOverview()
-  loadUserGrowth()
-  loadTokenTrend()
-  loadTop10()
-  console.log('数据加载完成')
-  
+  loadAllData()
+  refreshTimer = window.setInterval(loadAllData, 30000)
   window.addEventListener('resize', handleResize)
 })
 
 // 组件卸载时清理
 onBeforeUnmount(() => {
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  if (anomalyHideTimer !== null) {
+    clearTimeout(anomalyHideTimer)
+    anomalyHideTimer = null
+  }
   window.removeEventListener('resize', handleResize)
   userGrowthChartInstance?.dispose()
   tokenTrendChartInstance?.dispose()
@@ -716,5 +870,133 @@ onBeforeUnmount(() => {
 .ranking-box,
 .chart-box-large {
   height: 100%;
+}
+
+.anomaly-alert-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 12px 20px;
+  margin-bottom: 20px;
+  background: linear-gradient(90deg, rgba(255, 51, 51, 0.9), rgba(200, 0, 0, 0.9));
+  border: 2px solid #ff3333;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 18px;
+  font-weight: bold;
+  animation: anomalyBlink 0.8s ease-in-out infinite alternate;
+  box-shadow: 0 0 20px rgba(255, 51, 51, 0.6);
+}
+
+.anomaly-icon {
+  font-size: 22px;
+}
+
+.anomaly-text {
+  letter-spacing: 1px;
+}
+
+@keyframes anomalyBlink {
+  0% {
+    opacity: 1;
+    box-shadow: 0 0 20px rgba(255, 51, 51, 0.8);
+  }
+  100% {
+    opacity: 0.7;
+    box-shadow: 0 0 40px rgba(255, 51, 51, 1), 0 0 60px rgba(255, 51, 51, 0.5);
+  }
+}
+
+.anomaly-record-box {
+  min-height: 280px;
+  flex-shrink: 0;
+}
+
+.anomaly-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  color: rgba(76, 217, 100, 0.4);
+  font-size: 16px;
+}
+
+.anomaly-table {
+  margin-top: 10px;
+  overflow: hidden;
+}
+
+.anomaly-header {
+  display: grid;
+  grid-template-columns: 100px 200px 150px 1fr;
+  gap: 10px;
+  padding: 12px 15px;
+  background: #ff4757;
+  color: #fff;
+  font-weight: bold;
+  font-size: 15px;
+  border-radius: 4px 4px 0 0;
+}
+
+.anomaly-body {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.anomaly-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.anomaly-body::-webkit-scrollbar-track {
+  background: rgba(76, 217, 100, 0.1);
+}
+
+.anomaly-body::-webkit-scrollbar-thumb {
+  background: rgba(76, 217, 100, 0.5);
+  border-radius: 3px;
+}
+
+.anomaly-row {
+  display: grid;
+  grid-template-columns: 100px 200px 150px 1fr;
+  gap: 10px;
+  padding: 10px 15px;
+  font-size: 14px;
+  border-bottom: 1px solid rgba(76, 217, 100, 0.1);
+}
+
+.anomaly-row:nth-child(odd) {
+  background: rgba(255, 71, 87, 0.05);
+}
+
+.anomaly-row:nth-child(even) {
+  background: rgba(26, 35, 50, 0.3);
+}
+
+.col-time {
+  color: #ccc;
+}
+
+.col-metric {
+  color: #ff6b7a;
+  font-weight: bold;
+}
+
+.col-change {
+  font-weight: bold;
+}
+
+.col-change.up {
+  color: #ff4757;
+}
+
+.col-change.down {
+  color: #4cd964;
+}
+
+.col-value {
+  color: #4cd964;
+  text-align: right;
 }
 </style>
