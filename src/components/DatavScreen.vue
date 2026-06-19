@@ -1,6 +1,23 @@
 <template>
   <dv-full-screen-container>
     <div class="datav-screen">
+      <!-- 顶部异常提醒条：本轮所有异常指标并列显示 -->
+      <div v-if="isAlertFlashing" class="alert-bar">
+        <span class="alert-icon">⚠</span>
+        <span class="alert-prefix">检测到指标剧烈波动：</span>
+        <span
+          v-for="(a, i) in currentAlerts"
+          :key="i"
+          class="alert-item"
+        >
+          {{ a.metric }}
+          <span :class="a.changeRate >= 0 ? 'rate-up' : 'rate-down'">
+            {{ a.changeRate >= 0 ? '+' : '' }}{{ a.changeRate.toFixed(1) }}%
+          </span>
+          <span class="alert-current">（当前 {{ formatNumber(a.currentValue) }}）</span>
+        </span>
+      </div>
+
       <!-- 头部标题 -->
       <div class="header">
         <dv-decoration-10 class="decoration-left" />
@@ -125,18 +142,80 @@
             </div>
           </dv-border-box-8>
         </div>
+
+        <!-- 第五行：近期异常记录 -->
+        <div class="anomaly-row">
+          <dv-border-box-8>
+            <div class="chart-content">
+              <div class="chart-title">近期异常记录（最近 {{ MAX_ANOMALY_RECORDS }} 条）</div>
+              <div class="anomaly-table">
+                <div class="anomaly-header">
+                  <div>时间</div>
+                  <div>指标</div>
+                  <div>变化幅度</div>
+                  <div>当前数值</div>
+                </div>
+                <div class="anomaly-body">
+                  <div
+                    v-for="(row, idx) in anomalyList"
+                    :key="idx"
+                    class="anomaly-row-item"
+                  >
+                    <div>{{ row.time }}</div>
+                    <div>{{ row.metric }}</div>
+                    <div :class="row.changeRate >= 0 ? 'rate-up' : 'rate-down'">
+                      {{ row.changeRate >= 0 ? '+' : '' }}{{ row.changeRate.toFixed(1) }}%
+                    </div>
+                    <div>{{ formatNumber(row.currentValue) }}</div>
+                  </div>
+                  <div v-if="anomalyList.length === 0" class="anomaly-empty">
+                    暂无异常记录
+                  </div>
+                </div>
+              </div>
+            </div>
+          </dv-border-box-8>
+        </div>
       </div>
     </div>
   </dv-full-screen-container>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, nextTick, onBeforeUnmount } from 'vue'
 import * as echarts from 'echarts'
 import type { ECharts } from 'echarts'
 import { getOverview, getUserGrowth, getTokenTrend, getTokenTop10 } from '../api/datav'
 import type { OverviewData, TrendItem, Top10Item } from '../api/datav'
 import { mockOverviewData, mockUserGrowthData, mockTokenTrendData, mockTop10Data } from '../api/mock'
+
+// 定时刷新与异常检测相关常量
+const REFRESH_INTERVAL = 30_000
+const ANOMALY_THRESHOLD = 0.5
+const MAX_ANOMALY_RECORDS = 20
+const ALERT_MIN_DURATION = 10_000
+
+// 演示扰动配置（不修改 mock 文件，仅在赋值前对数值做轻微随机浮动）
+const DEMO_JITTER_ENABLED = true
+const DEMO_JITTER_RANGE = 0.05
+const DEMO_SPIKE_PROBABILITY = 0.1
+const DEMO_SPIKE_RANGE = 0.6
+const JITTER_MIN_VALUE = 10
+
+// 异常记录类型
+interface AnomalyRecord {
+  time: string
+  metric: string
+  changeRate: number
+  currentValue: number
+}
+
+// 待监测指标快照类型
+interface MetricSnapshot {
+  todayNewUsers: number
+  todayActiveUsers: number
+  totalTokens: number
+}
 
 // 概览数据
 const overviewData = ref<OverviewData | null>(null)
@@ -156,34 +235,85 @@ let tokenTrendChartInstance: ECharts | null = null
 // Token Top 10
 const top10Data = ref<Top10Item[]>([])
 
+// 异常检测状态
+const previousSnapshot = ref<MetricSnapshot | null>(null)
+const anomalyList = ref<AnomalyRecord[]>([])
+const currentAlerts = ref<AnomalyRecord[]>([])
+const alertVisible = ref<boolean>(false)
+const isAlertFlashing = computed(() => alertVisible.value && currentAlerts.value.length > 0)
+
+// 定时器与首次加载标志
+let refreshTimer: number | null = null
+let alertTimer: number | null = null
+let isFirstLoad = true
+
 // 格式化数字，添加千位分隔符
 const formatNumber = (num: number): string => {
   return num.toLocaleString()
 }
 
+// 时间格式化：YYYY-MM-DD HH:mm:ss
+const formatTime = (d: Date): string => {
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// 通用扰动：常态 ±5%，剧烈 ±60%（10% 概率），下限保护避免归零或假性异常
+const jitter = (value: number): number => {
+  if (!DEMO_JITTER_ENABLED || isFirstLoad) return value
+  if (value < JITTER_MIN_VALUE) return value
+  const isSpike = Math.random() < DEMO_SPIKE_PROBABILITY
+  const range = isSpike ? DEMO_SPIKE_RANGE : DEMO_JITTER_RANGE
+  const factor = 1 + (Math.random() * 2 - 1) * range
+  const next = Math.round(value * factor)
+  return Math.max(JITTER_MIN_VALUE, next)
+}
+
+// 累计类指标只允许向上扰动（保留 spike 概率以便触发告警），且单调不降
+const jitterMonotonic = (value: number, prev?: number): number => {
+  if (!DEMO_JITTER_ENABLED || isFirstLoad) return Math.max(value, prev ?? value)
+  if (value < JITTER_MIN_VALUE) return Math.max(value, prev ?? value)
+  const isSpike = Math.random() < DEMO_SPIKE_PROBABILITY
+  const range = isSpike ? DEMO_SPIKE_RANGE : DEMO_JITTER_RANGE
+  // 只取正向因子：[1, 1+range]
+  const factor = 1 + Math.random() * range
+  const baseline = Math.max(value, prev ?? 0)
+  return Math.round(baseline * factor)
+}
+
 // 加载概览数据
 const loadOverview = async () => {
+  let raw: OverviewData
   try {
-    console.log('开始加载概览数据')
-    overviewData.value = await getOverview()
-    console.log('API获取概览数据:', overviewData.value)
+    raw = await getOverview()
   } catch (error) {
     console.warn('API 请求失败，使用 Mock 数据', error)
-    overviewData.value = mockOverviewData
-    console.log('使用Mock概览数据:', overviewData.value)
+    raw = mockOverviewData
+  }
+  const prev = overviewData.value
+  // 普通指标：双向扰动；累计指标：单向扰动 + 单调不降
+  overviewData.value = {
+    ...raw,
+    totalUsers: jitterMonotonic(raw.totalUsers, prev?.totalUsers),
+    todayNewUsers: jitter(raw.todayNewUsers),
+    todayActiveUsers: jitter(raw.todayActiveUsers),
+    tokenUsersTotal: jitterMonotonic(raw.tokenUsersTotal, prev?.tokenUsersTotal),
+    totalTokens: jitterMonotonic(raw.totalTokens, prev?.totalTokens)
   }
 }
 
 // 加载用户增长趋势
 const loadUserGrowth = async () => {
+  let raw: TrendItem[]
   try {
-    console.log('加载用户增长趋势，维度：', userGrowthDimension.value)
-    userGrowthData.value = await getUserGrowth(userGrowthDimension.value)
-    console.log('用户增长数据：', userGrowthData.value)
+    raw = await getUserGrowth(userGrowthDimension.value)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    userGrowthData.value = mockUserGrowthData[userGrowthDimension.value]
+    console.warn('API 请求失败，使用 Mock 数据', error)
+    raw = mockUserGrowthData[userGrowthDimension.value]
   }
+  // 用户新增是增量类指标，可双向扰动让折线动起来
+  userGrowthData.value = raw.map(item => ({ ...item, value: jitter(item.value) }))
   await nextTick()
   setTimeout(() => {
     renderUserGrowthChart()
@@ -292,14 +422,15 @@ const renderUserGrowthChart = () => {
 
 // 加载 Token 趋势
 const loadTokenTrend = async () => {
+  let raw: TrendItem[]
   try {
-    console.log('加载Token趋势，维度：', tokenTrendDimension.value)
-    tokenTrendData.value = await getTokenTrend(tokenTrendDimension.value)
-    console.log('Token趋势数据：', tokenTrendData.value)
+    raw = await getTokenTrend(tokenTrendDimension.value)
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    tokenTrendData.value = mockTokenTrendData[tokenTrendDimension.value]
+    console.warn('API 请求失败，使用 Mock 数据', error)
+    raw = mockTokenTrendData[tokenTrendDimension.value]
   }
+  // 折线图按日切片视为当日消耗量（增量），允许双向扰动以驱动可视化
+  tokenTrendData.value = raw.map(item => ({ ...item, value: jitter(item.value) }))
   await nextTick()
   setTimeout(() => {
     renderTokenTrendChart()
@@ -408,12 +539,83 @@ const renderTokenTrendChart = () => {
 
 // 加载 Top 10 数据
 const loadTop10 = async () => {
+  let raw: Top10Item[]
   try {
-    top10Data.value = await getTokenTop10()
+    raw = await getTokenTop10()
   } catch (error) {
-    console.warn('API 请求失败，使用 Mock 数据')
-    top10Data.value = mockTop10Data
+    console.warn('API 请求失败，使用 Mock 数据', error)
+    raw = mockTop10Data
   }
+  // 个人累计消耗：单调不降扰动
+  const prevMap = new Map<string, number>()
+  top10Data.value.forEach(item => prevMap.set(item.nick_name, item.token_sum))
+  top10Data.value = raw.map(item => ({
+    ...item,
+    token_sum: jitterMonotonic(item.token_sum, prevMap.get(item.nick_name))
+  }))
+}
+
+// 异常检测：仅对相邻两次刷新做对比，本轮所有命中的指标一并记录
+const detectAnomaly = () => {
+  if (!overviewData.value) return
+  const snap: MetricSnapshot = {
+    todayNewUsers: overviewData.value.todayNewUsers,
+    todayActiveUsers: overviewData.value.todayActiveUsers,
+    totalTokens: overviewData.value.totalTokens
+  }
+  // 冷启动：仅记录快照，不报警
+  if (previousSnapshot.value === null) {
+    previousSnapshot.value = snap
+    return
+  }
+  const checks: Array<{ key: keyof MetricSnapshot; label: string }> = [
+    { key: 'todayNewUsers', label: '今日新增用户' },
+    { key: 'todayActiveUsers', label: 'DAU' },
+    { key: 'totalTokens', label: '累计 Token 消耗' }
+  ]
+  const hits: AnomalyRecord[] = []
+  const now = formatTime(new Date())
+  checks.forEach(({ key, label }) => {
+    const prevVal = previousSnapshot.value![key]
+    const currVal = snap[key]
+    // 下限保护：基数过小时跳过，避免假性异常
+    if (prevVal < JITTER_MIN_VALUE) return
+    const rate = (currVal - prevVal) / prevVal
+    if (Math.abs(rate) > ANOMALY_THRESHOLD) {
+      hits.push({
+        time: now,
+        metric: label,
+        changeRate: rate * 100,
+        currentValue: currVal
+      })
+    }
+  })
+  if (hits.length > 0) {
+    currentAlerts.value = hits
+    alertVisible.value = true
+    // 历史列表保留最近 N 条
+    anomalyList.value.unshift(...hits)
+    if (anomalyList.value.length > MAX_ANOMALY_RECORDS) {
+      anomalyList.value.length = MAX_ANOMALY_RECORDS
+    }
+    // 红条至少停留 ALERT_MIN_DURATION 毫秒
+    if (alertTimer !== null) {
+      clearTimeout(alertTimer)
+    }
+    alertTimer = window.setTimeout(() => {
+      alertVisible.value = false
+      currentAlerts.value = []
+      alertTimer = null
+    }, ALERT_MIN_DURATION)
+  }
+  previousSnapshot.value = snap
+}
+
+// 一次性刷新全部数据，并触发异常检测
+const refreshAll = async () => {
+  await Promise.all([loadOverview(), loadUserGrowth(), loadTokenTrend(), loadTop10()])
+  detectAnomaly()
+  isFirstLoad = false
 }
 
 // 窗口 resize 处理
@@ -423,20 +625,24 @@ const handleResize = () => {
 }
 
 // 组件挂载
-onMounted(() => {
-  console.log('组件挂载开始')
-  loadOverview()
-  loadUserGrowth()
-  loadTokenTrend()
-  loadTop10()
-  console.log('数据加载完成')
-  
+onMounted(async () => {
+  await refreshAll()
+  // 启动 30 秒自动刷新
+  refreshTimer = window.setInterval(refreshAll, REFRESH_INTERVAL)
   window.addEventListener('resize', handleResize)
 })
 
 // 组件卸载时清理
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  if (alertTimer !== null) {
+    clearTimeout(alertTimer)
+    alertTimer = null
+  }
   userGrowthChartInstance?.dispose()
   tokenTrendChartInstance?.dispose()
 })
@@ -716,5 +922,136 @@ onBeforeUnmount(() => {
 .ranking-box,
 .chart-box-large {
   height: 100%;
+}
+
+/* 顶部异常告警条 */
+.alert-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 20px;
+  margin-bottom: 12px;
+  background: #ff2d55;
+  color: #fff;
+  font-size: 16px;
+  font-weight: bold;
+  border-radius: 4px;
+  box-shadow: 0 0 20px rgba(255, 45, 85, 0.8);
+  animation: alertFlash 0.8s ease-in-out infinite;
+}
+
+.alert-icon {
+  font-size: 20px;
+}
+
+.alert-prefix {
+  letter-spacing: 1px;
+}
+
+.alert-item {
+  padding-right: 12px;
+  border-right: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+.alert-item:last-child {
+  border-right: none;
+}
+
+.alert-current {
+  font-weight: normal;
+  opacity: 0.85;
+  margin-left: 4px;
+}
+
+@keyframes alertFlash {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 20px rgba(255, 45, 85, 0.8);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 30px rgba(255, 45, 85, 1);
+  }
+}
+
+/* 近期异常记录列表 */
+.anomaly-row {
+  height: 260px;
+  flex-shrink: 0;
+}
+
+.anomaly-table {
+  height: calc(100% - 40px);
+  margin-top: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.anomaly-header {
+  display: grid;
+  grid-template-columns: 200px 1fr 140px 160px;
+  gap: 10px;
+  padding: 12px 15px;
+  background: #4cd964;
+  color: #0a1929;
+  font-weight: bold;
+  font-size: 16px;
+  border-radius: 4px 4px 0 0;
+  flex-shrink: 0;
+}
+
+.anomaly-body {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.anomaly-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.anomaly-body::-webkit-scrollbar-track {
+  background: rgba(76, 217, 100, 0.1);
+}
+
+.anomaly-body::-webkit-scrollbar-thumb {
+  background: rgba(76, 217, 100, 0.5);
+  border-radius: 3px;
+}
+
+.anomaly-row-item {
+  display: grid;
+  grid-template-columns: 200px 1fr 140px 160px;
+  gap: 10px;
+  padding: 10px 15px;
+  color: #4cd964;
+  font-size: 14px;
+  border-bottom: 1px solid rgba(76, 217, 100, 0.1);
+}
+
+.anomaly-row-item:nth-child(odd) {
+  background: rgba(76, 217, 100, 0.05);
+}
+
+.anomaly-row-item:nth-child(even) {
+  background: rgba(26, 35, 50, 0.3);
+}
+
+.anomaly-empty {
+  text-align: center;
+  color: rgba(76, 217, 100, 0.6);
+  padding: 30px 0;
+  font-size: 14px;
+}
+
+.rate-up {
+  color: #ff2d55;
+  font-weight: bold;
+}
+
+.rate-down {
+  color: #4cd964;
+  font-weight: bold;
 }
 </style>
